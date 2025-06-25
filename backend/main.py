@@ -24,7 +24,7 @@ current_data = None
 current_filename = None
 
 # Columns to exclude from Excel downloads
-EXCLUDED_COLUMNS = ['Is Open', 'Position', 'Expiry Date', 'Needs To Change Password']
+EXCLUDED_COLUMNS = ['Is Open', 'Position', 'Expiry Date', 'Needs To Change Password','Branch Name','Close Reason','User ID','Use Admin Log']
 
 def create_excel_buffer(df, sheet_name='Data'):
     """Helper function to create a properly formatted Excel file in memory"""
