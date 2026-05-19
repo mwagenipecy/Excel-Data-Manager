@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException, Query
+from fastapi import Depends, FastAPI, File, UploadFile, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 import pandas as pd
@@ -7,6 +7,18 @@ from typing import Optional, List, Dict
 import os
 from datetime import datetime
 import traceback
+
+from excel_utils import (
+    EXCLUDED_COLUMNS,
+    create_excel_buffer,
+    create_safe_filename,
+    filter_dataframe_for_download_all,
+    prepare_dataframe_for_excel,
+)
+import auth_routes
+import email_routes
+from activity_log_store import append_activity_log
+from auth_deps import get_current_user_email
 
 app = FastAPI(title="Excel Data Manager API", version="1.0.0")
 
@@ -23,41 +35,10 @@ app.add_middleware(
 current_data = None
 current_filename = None
 
-# Columns to exclude from Excel downloads
-EXCLUDED_COLUMNS = ['Is Open', 'Position', 'Expiry Date', 'Needs To Change Password','Branch Name','Close Reason','User ID','Use Admin Log']
 
-def create_excel_buffer(df, sheet_name='Data'):
-    """Helper function to create a properly formatted Excel file in memory"""
-    try:
-        # Clean the dataframe
-        df_clean = df.copy()
-        
-        # Handle any potential data issues
-        for col in df_clean.columns:
-            if df_clean[col].dtype == 'object':
-                # Convert to string and replace nan values
-                df_clean[col] = df_clean[col].astype(str).replace(['nan', 'None', 'NaN'], '')
-            # Fill any remaining NaN values
-            df_clean[col] = df_clean[col].fillna('')
-        
-        # Create Excel file in memory
-        excel_buffer = io.BytesIO()
-        
-        # Use openpyxl engine with proper options
-        with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-            df_clean.to_excel(writer, sheet_name=sheet_name, index=False, na_rep='')
-        
-        # Get content and verify it's not empty
-        excel_content = excel_buffer.getvalue()
-        
-        if len(excel_content) == 0:
-            raise ValueError("Generated Excel file is empty")
-        
-        return excel_content
-        
-    except Exception as e:
-        print(f"Error in create_excel_buffer: {e}")
-        raise Exception(f"Error creating Excel file: {str(e)}")
+def get_current_data():
+    return current_data
+
 
 def load_initial_data():
     """Load initial data if available"""
@@ -76,63 +57,24 @@ def load_initial_data():
         except Exception as e:
             print(f"Error loading initial data: {e}")
 
-def filter_dataframe_for_download_all(df):
-    """Apply filters for 'Download All' functionality"""
-    # Check if 'Is Open' column exists
-    if 'Is Open' not in df.columns:
-        print("Warning: 'Is Open' column not found, returning all data")
-        return df.copy()
-    
-    # Filter for active users only (Is Open = 'Yes')
-    # Handle different possible values (case-insensitive)
-    filtered_df = df[df['Is Open'].astype(str).str.lower().isin(['yes', 'true', '1', 'active'])].copy()
-    
-    print(f"Original records: {len(df)}, Filtered records: {len(filtered_df)}")
-    print(f"Unique 'Is Open' values in original data: {df['Is Open'].unique()}")
-    
-    return filtered_df
-
-def prepare_dataframe_for_excel(df):
-    """Remove excluded columns from dataframe for Excel download"""
-    df_copy = df.copy()
-    
-    # Remove excluded columns if they exist
-    columns_to_remove = [col for col in EXCLUDED_COLUMNS if col in df_copy.columns]
-    if columns_to_remove:
-        df_copy = df_copy.drop(columns=columns_to_remove)
-        print(f"Removed columns for Excel: {columns_to_remove}")
-    
-    return df_copy
-
-
-def create_safe_filename(name, fallback_prefix="File"):
-    """Create a safe filename from a string"""
-    if not name or str(name).strip() == '':
-        return f"{fallback_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    
-    # Keep only alphanumeric characters, spaces, hyphens, and underscores
-    safe_name = "".join(c for c in str(name) if c.isalnum() or c in (' ', '-', '_')).strip()
-    
-    # If the safe name is empty after cleaning, use fallback
-    if not safe_name:
-        safe_name = f"{fallback_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    
-    # Limit length to 50 characters
-    if len(safe_name) > 50:
-        safe_name = safe_name[:50]
-    
-    return safe_name
-
 @app.on_event("startup")
 async def startup_event():
     load_initial_data()
+    email_routes.init_email_routes(get_current_data)
+
+
+app.include_router(auth_routes.router)
+app.include_router(email_routes.router)
 
 @app.get("/")
 async def root():
     return {"message": "Excel Data Manager API", "status": "running"}
 
 @app.post("/upload-excel")
-async def upload_excel(file: UploadFile = File(...)):
+async def upload_excel(
+    file: UploadFile = File(...),
+    user_email: str = Depends(get_current_user_email),
+):
     """Upload and replace current Excel data"""
     global current_data, current_filename
     
@@ -161,13 +103,33 @@ async def upload_excel(file: UploadFile = File(...)):
         
         current_data = df
         current_filename = file.filename
+
+        removed_email_subscribers = []
+        try:
+            from excel_utils import filter_dataframe_for_download_all
+            from subscriber_store import sync_emails_to_active_subscribers
+            if "Subscriber Name" in df.columns:
+                filtered = filter_dataframe_for_download_all(df)
+                active_names = filtered["Subscriber Name"].dropna().unique().tolist()
+                _, removed_email_subscribers = sync_emails_to_active_subscribers(
+                    [str(n) for n in active_names]
+                )
+        except Exception as sync_err:
+            print(f"Subscriber email sync after upload: {sync_err}")
+
+        append_activity_log(
+            user_email,
+            "upload_document",
+            {"filename": file.filename, "records": len(df)},
+        )
         
         return {
             "message": "File uploaded successfully",
             "filename": file.filename,
             "rows": len(df),
             "columns": len(df.columns),
-            "column_names": df.columns.tolist()
+            "column_names": df.columns.tolist(),
+            "subscriber_emails_removed": len(removed_email_subscribers),
         }
     
     except Exception as e:
