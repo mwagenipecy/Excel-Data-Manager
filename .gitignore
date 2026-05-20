@@ -5,3 +5,5 @@ backend/venv/
 backend/data/
 backend/__pycache__/
 backend/uploaded_*
+frontend/node_modules/
+frontend/build/
